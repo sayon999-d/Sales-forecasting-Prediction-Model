@@ -2,6 +2,8 @@
 
 A production-ready, end-to-end **sales forecasting platform** built with Streamlit. Fetch datasets directly from Kaggle, combine multiple CSV sources, train regression models with configurable strategies, and generate interactive predictions — all from a single web interface.
 
+### [Live Demo](https://sales-forecasting-prediction-model-n.streamlit.app/)
+
 ---
 
 ##  System Architecture
