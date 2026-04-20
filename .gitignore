@@ -1,0 +1,27 @@
+# Environment & secrets
+.env
+.kaggle/
+.streamlit/secrets.toml
+
+# Cached data & models
+data/
+models/
+artifacts/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
