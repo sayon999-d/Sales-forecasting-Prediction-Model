@@ -65,10 +65,10 @@ graph TB
 
 ```mermaid
 flowchart LR
-    A["1️ Fetch Data"] --> B["2 Combine & Configure"]
+    A["1 Fetch Data"] --> B["2 Combine & Configure"]
     B --> C["3 Train Models"]
-    C --> D["4️ Evaluate & Select"]
-    D --> E["5️ Predict & Visualize"]
+    C --> D["4 Evaluate & Benchmark"]
+    D --> E["5 Predict & Visualize"]
 
     style A fill:#0f766e,color:#fff,stroke:#0f766e
     style B fill:#2563eb,color:#fff,stroke:#2563eb
@@ -198,9 +198,10 @@ Set base values and generate predictions over configurable time horizons with mu
 | **Auto Feature Engineering** | DateTime enrichment, lag features, and rolling-window statistics |
 | **Model Tournament** | Trains Linear Regression, Random Forest, and Extra Trees — picks the best |
 | **Time-Series Validation** | Chronological splits with TimeSeriesSplit backtesting |
+| **Evaluation & Benchmark** | PASS/FAIL accuracy checks (MAE/RMSE thresholds), 6-model timed benchmark with time-reduction metrics |
 | **3 Prediction Modes** | Batch CSV, manual entry, and scenario-over-time forecasting |
 | **Interactive Graphs** | Switch between Line+Trend, Bar, and Cumulative views |
-| **One-Click Export** | Download metrics JSON and prediction CSVs |
+| **One-Click Export** | Download metrics JSON, evaluation reports, benchmark CSVs, and prediction CSVs |
 
 ---
 
@@ -285,7 +286,10 @@ sales-forecast-app/
 │   └── secrets.toml.example     # Secrets template for deployment
 ├── artifacts/
 │   ├── streamlit_metrics.json   # Training metrics output
-│   └── streamlit_sample_predictions.csv
+│   ├── streamlit_sample_predictions.csv
+│   ├── evaluation_results.json  # PASS/FAIL evaluation report
+│   ├── benchmark_comparison.csv # 6-model benchmark with timing
+│   └── benchmark_tscv.csv       # TimeSeriesSplit CV results
 ├── data/
 │   └── kaggle_cache/            # Cached Kaggle downloads
 ├── models/
@@ -318,6 +322,29 @@ sales-forecast-app/
 | Lag Steps | 1, 2, 3, 7, 14, 28 | 1, 7, 14 |
 | Rolling Windows | 3, 7, 14, 28 | 7, 14 |
 | Backtest Splits | 2–6 | 3 |
+
+### Benchmark Models
+
+| Category | Models |
+|---|---|
+| **Regression** | LinearRegression, Ridge, ElasticNet |
+| **Tree-Based** | RandomForest (200 trees), GradientBoosting (200 trees), ExtraTrees (200 trees) |
+
+### Evaluation Outputs
+
+| File | Contents |
+|---|---|
+| `evaluation_results.json` | Model name, MAE, RMSE, R², PASS/FAIL verdict, thresholds, run timestamp |
+| `benchmark_comparison.csv` | Per-model MAE, RMSE, R², fit_seconds, predict_seconds, total_seconds |
+| `benchmark_tscv.csv` | TimeSeriesSplit CV mean/std for MAE and RMSE per model |
+
+### Time-Reduction Calculation
+
+```
+reduction_% = ((T_baseline − T_automated) / T_baseline) × 100
+```
+
+Enter your old/manual evaluation suite time in the dashboard to see the automated time savings.
 
 ---
 

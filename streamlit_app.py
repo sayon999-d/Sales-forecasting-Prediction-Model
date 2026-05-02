@@ -1,6 +1,8 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -9,13 +11,18 @@ from zipfile import ZipFile
 
 import altair as alt
 import joblib
+import numpy as np
 import pandas as pd
 import streamlit as st
 from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor
+from sklearn.ensemble import (
+    ExtraTreesRegressor,
+    GradientBoostingRegressor,
+    RandomForestRegressor,
+)
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import ElasticNet, LinearRegression, Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import TimeSeriesSplit, train_test_split
 from sklearn.pipeline import Pipeline
@@ -29,6 +36,9 @@ KAGGLE_CACHE_DIR = APP_DIR / "data" / "kaggle_cache"
 MODEL_BUNDLE_PATH = MODEL_DIR / "streamlit_model_bundle.joblib"
 METRICS_PATH = ARTIFACT_DIR / "streamlit_metrics.json"
 PREDICTIONS_PATH = ARTIFACT_DIR / "streamlit_sample_predictions.csv"
+EVAL_RESULTS_PATH = ARTIFACT_DIR / "evaluation_results.json"
+BENCHMARK_CSV_PATH = ARTIFACT_DIR / "benchmark_comparison.csv"
+BENCHMARK_TSCV_PATH = ARTIFACT_DIR / "benchmark_tscv.csv"
 PROVIDED_KAGGLE_SOURCES = [
     {
         "label": "Sales Forecasting",
@@ -685,6 +695,115 @@ def run_time_series_backtesting(
         )
 
     return sorted(summaries, key=lambda item: item["cv_rmse_mean"])
+
+
+BENCHMARK_MODELS: dict[str, Any] = {
+    "LinearRegression": LinearRegression(),
+    "Ridge": Ridge(alpha=1.0),
+    "ElasticNet": ElasticNet(alpha=0.1, l1_ratio=0.5, max_iter=2000),
+    "RandomForest": RandomForestRegressor(n_estimators=200, random_state=42, n_jobs=-1),
+    "GradientBoosting": GradientBoostingRegressor(n_estimators=200, random_state=42, max_depth=5),
+    "ExtraTrees": ExtraTreesRegressor(n_estimators=200, random_state=42, n_jobs=-1),
+}
+
+
+def timed_evaluate_model(
+    name: str,
+    pipeline: Pipeline,
+    x_train: pd.DataFrame,
+    x_test: pd.DataFrame,
+    y_train: pd.Series,
+    y_test: pd.Series,
+) -> dict[str, Any]:
+    t0 = time.perf_counter()
+    pipeline.fit(x_train, y_train)
+    fit_time = time.perf_counter() - t0
+
+    t1 = time.perf_counter()
+    preds = pipeline.predict(x_test)
+    predict_time = time.perf_counter() - t1
+
+    t2 = time.perf_counter()
+    mae = float(mean_absolute_error(y_test, preds))
+    rmse = float(mean_squared_error(y_test, preds) ** 0.5)
+    r2 = float(r2_score(y_test, preds))
+    metric_time = time.perf_counter() - t2
+
+    return {
+        "model": name,
+        "MAE": round(mae, 4),
+        "RMSE": round(rmse, 4),
+        "R2": round(r2, 4),
+        "fit_seconds": round(fit_time, 4),
+        "predict_seconds": round(predict_time, 4),
+        "total_seconds": round(fit_time + predict_time + metric_time, 4),
+    }
+
+
+def run_model_benchmark(
+    preprocessor: ColumnTransformer,
+    x_train: pd.DataFrame,
+    x_test: pd.DataFrame,
+    y_train: pd.Series,
+    y_test: pd.Series,
+    random_state: int = 42,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for name, estimator in BENCHMARK_MODELS.items():
+        pipeline = Pipeline(
+            steps=[
+                ("preprocessor", clone(preprocessor)),
+                ("model", clone(estimator)),
+            ]
+        )
+        rows.append(timed_evaluate_model(name, pipeline, x_train, x_test, y_train, y_test))
+    return rows
+
+
+def run_benchmark_tscv(
+    preprocessor: ColumnTransformer,
+    x: pd.DataFrame,
+    y: pd.Series,
+    n_splits: int = 5,
+    random_state: int = 42,
+) -> list[dict[str, Any]]:
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    records: list[dict[str, Any]] = []
+    for name, estimator in BENCHMARK_MODELS.items():
+        fold_mae, fold_rmse = [], []
+        for train_idx, test_idx in tscv.split(x):
+            pipe = Pipeline(
+                steps=[
+                    ("preprocessor", clone(preprocessor)),
+                    ("model", clone(estimator)),
+                ]
+            )
+            pipe.fit(x.iloc[train_idx], y.iloc[train_idx])
+            preds = pipe.predict(x.iloc[test_idx])
+            fold_mae.append(mean_absolute_error(y.iloc[test_idx], preds))
+            fold_rmse.append(mean_squared_error(y.iloc[test_idx], preds) ** 0.5)
+        records.append({
+            "model": name,
+            "cv_MAE_mean": round(float(np.mean(fold_mae)), 4),
+            "cv_MAE_std": round(float(np.std(fold_mae)), 4),
+            "cv_RMSE_mean": round(float(np.mean(fold_rmse)), 4),
+            "cv_RMSE_std": round(float(np.std(fold_rmse)), 4),
+        })
+    return records
+
+
+def compute_eval_time_reduction(
+    t_baseline: float,
+    t_automated: float,
+) -> dict[str, float]:
+    if t_baseline <= 0:
+        return {"T_baseline_seconds": 0, "T_automated_seconds": round(t_automated, 4), "reduction_percent": 0}
+    reduction_pct = ((t_baseline - t_automated) / t_baseline) * 100
+    return {
+        "T_baseline_seconds": round(t_baseline, 4),
+        "T_automated_seconds": round(t_automated, 4),
+        "reduction_percent": round(reduction_pct, 2),
+    }
 
 
 def get_feature_names(preprocessor: ColumnTransformer) -> list[str]:
@@ -1604,6 +1723,18 @@ def training_section() -> None:
 
         st.session_state["trained_bundle"] = bundle
         st.session_state["columns_used"] = columns_used
+        st.session_state["eval_config"] = {
+            "combined_df": combined_df,
+            "target_column": preview_target,
+            "validation_strategy": validation_strategy,
+            "date_column": date_column,
+            "group_columns": group_columns,
+            "lag_steps": lag_steps,
+            "rolling_windows": rolling_windows,
+            "test_size": float(test_size),
+            "random_state": int(random_state),
+            "max_training_rows": int(max_training_rows),
+        }
 
         st.success(
             f"Training completed. Best model: {bundle['metrics']['best_model']} "
@@ -1649,8 +1780,219 @@ def training_section() -> None:
         )
 
 
+def evaluation_section() -> None:
+    st.subheader("3. Evaluate & Benchmark")
+
+    bundle = st.session_state.get("trained_bundle")
+    if bundle is None and MODEL_BUNDLE_PATH.exists():
+        bundle = load_saved_bundle(str(MODEL_BUNDLE_PATH))
+        st.session_state["trained_bundle"] = bundle
+
+    if bundle is None:
+        st.info("Train a model first to run evaluation and benchmarking.")
+        return
+
+    metrics = bundle["metrics"]
+    best = metrics["best_model_metrics"]
+
+    st.markdown("#### Current Model Performance")
+    perf_cols = st.columns(4)
+    perf_cols[0].metric("Best Model", metrics["best_model"])
+    perf_cols[1].metric("MAE", f"{best['mae']:.4f}")
+    perf_cols[2].metric("RMSE", f"{best['rmse']:.4f}")
+    perf_cols[3].metric("R²", f"{best['r2']:.4f}")
+
+    st.markdown("#### Acceptance Thresholds")
+    thresh_cols = st.columns(2)
+    mae_target = thresh_cols[0].number_input(
+        "MAE Target (≤)", min_value=0.0, value=500.0, step=50.0, key="eval_mae_target",
+    )
+    rmse_target = thresh_cols[1].number_input(
+        "RMSE Target (≤)", min_value=0.0, value=800.0, step=50.0, key="eval_rmse_target",
+    )
+
+    mae_pass = best["mae"] <= mae_target
+    rmse_pass = best["rmse"] <= rmse_target
+    overall = mae_pass and rmse_pass
+
+    verdict_cols = st.columns(3)
+    verdict_cols[0].metric("MAE Check", "PASS ✅" if mae_pass else "FAIL ❌")
+    verdict_cols[1].metric("RMSE Check", "PASS ✅" if rmse_pass else "FAIL ❌")
+    verdict_cols[2].metric("Overall", "PASS ✅" if overall else "FAIL ❌")
+
+    eval_result = {
+        "model": metrics["best_model"],
+        "run_timestamp": datetime.now(timezone.utc).isoformat(),
+        "dataset": ", ".join(metrics.get("sources", [])),
+        "split": metrics.get("split_summary", {}),
+        "train_rows": metrics.get("train_rows", 0),
+        "test_rows": metrics.get("test_rows", 0),
+        "MAE": best["mae"],
+        "RMSE": best["rmse"],
+        "R2": best["r2"],
+        "MAE_target": mae_target,
+        "MAE_pass": mae_pass,
+        "RMSE_target": rmse_target,
+        "RMSE_pass": rmse_pass,
+        "overall": "PASS" if overall else "FAIL",
+    }
+    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    EVAL_RESULTS_PATH.write_text(json.dumps(eval_result, indent=2), encoding="utf-8")
+
+    st.download_button(
+        "Download Evaluation Report (JSON)",
+        data=json.dumps(eval_result, indent=2).encode("utf-8"),
+        file_name="evaluation_results.json",
+        mime="application/json",
+        key="dl_eval_json",
+    )
+
+    st.markdown("---")
+    st.markdown("#### Multi-Model Benchmark")
+    st.caption(
+        "Compare 6 models (LinearRegression, Ridge, ElasticNet, "
+        "RandomForest, GradientBoosting, ExtraTrees) on the same data split with timing."
+    )
+
+    eval_config = st.session_state.get("eval_config")
+    if eval_config is None:
+        st.info(
+            "Re-train your model from the section above to enable the full benchmark. "
+            "The training data is needed to compare models."
+        )
+        return
+
+    baseline_time = st.number_input(
+        "Baseline evaluation time (seconds)",
+        min_value=0.0,
+        value=0.0,
+        step=10.0,
+        help="Enter the wall-clock seconds of your old/manual evaluation. "
+             "Set to 0 to skip the time-reduction calculation.",
+        key="eval_baseline_time",
+    )
+
+    if st.button("Run Full Benchmark", type="primary", key="run_benchmark_btn"):
+        with st.spinner("Preparing data and running benchmark across 6 models…"):
+            try:
+                config = eval_config
+                working_df = config["combined_df"].copy()
+                target_col = config["target_column"]
+                working_df[target_col] = pd.to_numeric(working_df[target_col], errors="coerce")
+
+                if config["validation_strategy"] == "time_series" and config["date_column"]:
+                    working_df = build_time_series_features(
+                        df=working_df,
+                        target_column=target_col,
+                        date_column=config["date_column"],
+                        group_columns=config["group_columns"],
+                        lag_steps=config["lag_steps"],
+                        rolling_windows=config["rolling_windows"],
+                    )
+
+                working_df = sample_training_data(
+                    df=working_df,
+                    max_training_rows=config["max_training_rows"],
+                    validation_strategy=config["validation_strategy"],
+                    date_column=config["date_column"],
+                    random_state=config["random_state"],
+                )
+
+                date_series = (
+                    pd.to_datetime(working_df[config["date_column"]], errors="coerce")
+                    if config["date_column"] and config["date_column"] in working_df.columns
+                    else None
+                )
+                working_df = enrich_datetime_columns(working_df)
+                valid_mask = working_df[target_col].notna()
+                working_df = working_df.loc[valid_mask].reset_index(drop=True)
+                if date_series is not None:
+                    date_series = date_series.loc[valid_mask].reset_index(drop=True)
+
+                x = working_df.drop(columns=[target_col])
+                y = working_df[target_col]
+
+                x_train, x_test, y_train, y_test, _ = split_train_test(
+                    x, y,
+                    validation_strategy=config["validation_strategy"],
+                    test_size=config["test_size"],
+                    random_state=config["random_state"],
+                    date_series=date_series,
+                )
+
+                preprocessor = build_preprocessor(x_train)
+
+                pipeline_start = time.perf_counter()
+                benchmark_rows = run_model_benchmark(
+                    preprocessor, x_train, x_test, y_train, y_test,
+                    random_state=config["random_state"],
+                )
+                pipeline_end = time.perf_counter()
+                t_auto = pipeline_end - pipeline_start
+
+                comparison_df = pd.DataFrame(benchmark_rows)
+                comparison_df = comparison_df.sort_values("RMSE").reset_index(drop=True)
+                BENCHMARK_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
+                comparison_df.to_csv(BENCHMARK_CSV_PATH, index=False)
+
+                st.session_state["benchmark_results"] = comparison_df
+                st.session_state["benchmark_time"] = t_auto
+
+                if config["validation_strategy"] == "time_series":
+                    x_full = pd.concat([x_train, x_test], ignore_index=True)
+                    y_full = pd.concat([y_train, y_test], ignore_index=True)
+                    tscv_rows = run_benchmark_tscv(
+                        preprocessor, x_full, y_full, n_splits=5,
+                        random_state=config["random_state"],
+                    )
+                    tscv_df = pd.DataFrame(tscv_rows).sort_values("cv_RMSE_mean").reset_index(drop=True)
+                    tscv_df.to_csv(BENCHMARK_TSCV_PATH, index=False)
+                    st.session_state["benchmark_tscv"] = tscv_df
+
+            except Exception as exc:
+                st.error(f"Benchmark failed: {exc}")
+                return
+
+    benchmark_df = st.session_state.get("benchmark_results")
+    if benchmark_df is not None:
+        st.markdown("##### Comparison Table")
+        st.dataframe(benchmark_df, use_container_width=True)
+
+        t_auto = st.session_state.get("benchmark_time", 0)
+        st.caption(f"Total benchmark time: {t_auto:.2f}s")
+
+        if baseline_time > 0:
+            reduction = compute_eval_time_reduction(baseline_time, t_auto)
+            red_cols = st.columns(3)
+            red_cols[0].metric("Baseline Time", f"{reduction['T_baseline_seconds']:.2f}s")
+            red_cols[1].metric("Automated Time", f"{reduction['T_automated_seconds']:.2f}s")
+            red_cols[2].metric("Time Reduction", f"{reduction['reduction_percent']:.1f}%")
+
+        tscv_df = st.session_state.get("benchmark_tscv")
+        if tscv_df is not None:
+            st.markdown("##### TimeSeriesSplit Cross-Validation")
+            st.dataframe(tscv_df, use_container_width=True)
+
+        dl_cols = st.columns(2)
+        dl_cols[0].download_button(
+            "Download Benchmark CSV",
+            data=benchmark_df.to_csv(index=False).encode("utf-8"),
+            file_name="benchmark_comparison.csv",
+            mime="text/csv",
+            key="dl_bench_csv",
+        )
+        if tscv_df is not None:
+            dl_cols[1].download_button(
+                "Download TSCV CSV",
+                data=tscv_df.to_csv(index=False).encode("utf-8"),
+                file_name="benchmark_tscv.csv",
+                mime="text/csv",
+                key="dl_tscv_csv",
+            )
+
+
 def prediction_section() -> None:
-    st.subheader("3. Predict")
+    st.subheader("4. Predict")
 
     bundle = st.session_state.get("trained_bundle")
     if bundle is None and MODEL_BUNDLE_PATH.exists():
@@ -1730,8 +2072,7 @@ def prediction_section() -> None:
         st.session_state["prediction_target_column"] = bundle["target_column"]
         st.session_state["prediction_chart_column"] = prediction_chart_column
 
-    # Render from session_state so the graph persists across reruns
-    # (e.g. when the user switches the graph view radio button)
+
     if "prediction_results" in st.session_state:
         results = st.session_state["prediction_results"]
         stored_target = st.session_state.get("prediction_target_column", bundle["target_column"])
@@ -1772,6 +2113,7 @@ def main() -> None:
 
     dataset_fetcher_section()
     training_section()
+    evaluation_section()
     prediction_section()
     model_notes_section()
 
